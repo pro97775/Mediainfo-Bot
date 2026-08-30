@@ -1,0 +1,45 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      PORT: 8080
+      TMP_DIR: /app/downloads
+      SESSION_DIR: /app/session
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist the pyrogram session so restarts do not re-create the
+      # per-datacenter auth keys, and keep probe chunks off the image layer.
+      - bot_session:/app/session
+      - bot_tmp:/app/downloads
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  mongo_data:
+  bot_session:
+  bot_tmp:
+
