@@ -1,29 +1,29 @@
-"""Datacenter-aware partial media downloader.
+# """Datacenter-aware partial media downloader.
 
-Why this module exists
-----------------------
-``Client.stream_media`` (pyrogram / pyrofork) opens a *brand new* MTProto
-session for every call and, when the file lives on a datacenter other than the
-one the bot is logged into, performs a full
-``auth.ExportAuthorization`` + ``auth.ImportAuthorization`` handshake each time.
+# Why this module exists
+# ----------------------
+# ``Client.stream_media`` (pyrogram / pyrofork) opens a *brand new* MTProto
+# session for every call and, when the file lives on a datacenter other than the
+# one the bot is logged into, performs a full
+# ``auth.ExportAuthorization`` + ``auth.ImportAuthorization`` handshake each time.
 
-The bot probes a file in several growing steps (16 KB, 1 MB, 3 MB ...), so a
-single file used to trigger one session + one authorisation handshake per step.
-On foreign DCs Telegram answers that burst with ``FloodWait`` or
-``AUTH_BYTES_INVALID``; pyrogram catches those internally, logs them and simply
-returns an empty generator.  The caller then sees a 0-byte file and silently
-falls back to Telegram's own (very poor) metadata -- this is the
-"sometimes no media info for files from other DC" bug.
+# The bot probes a file in several growing steps (16 KB, 1 MB, 3 MB ...), so a
+# single file used to trigger one session + one authorisation handshake per step.
+# On foreign DCs Telegram answers that burst with ``FloodWait`` or
+# ``AUTH_BYTES_INVALID``; pyrogram catches those internally, logs them and simply
+# returns an empty generator.  The caller then sees a 0-byte file and silently
+# falls back to Telegram's own (very poor) metadata -- this is the
+# "sometimes no media info for files from other DC" bug.
 
-What this module does
----------------------
-* keeps **one long-lived media session per datacenter** and reuses it,
-* downloads **byte ranges** so probe steps can append instead of restarting,
-* records ``FloodWait`` **per datacenter** instead of globally,
-* recovers from ``AuthBytesInvalid`` by rebuilding the session,
-* follows ``FileMigrate`` (file moved to another DC),
-* reports CDN redirects so the caller can fall back to pyrogram.
-"""
+# What this module does
+# ---------------------
+# * keeps **one long-lived media session per datacenter** and reuses it,
+# * downloads **byte ranges** so probe steps can append instead of restarting,
+# * records ``FloodWait`` **per datacenter** instead of globally,
+# * recovers from ``AuthBytesInvalid`` by rebuilding the session,
+# * follows ``FileMigrate`` (file moved to another DC),
+# * reports CDN redirects so the caller can fall back to pyrogram.
+# """
 
 import asyncio
 import logging
