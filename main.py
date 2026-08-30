@@ -1,14 +1,14 @@
-"""MediaInfo Bot - extracts media metadata from Telegram files and rewrites captions.
+# """MediaInfo Bot - extracts media metadata from Telegram files and rewrites captions.
 
-Probing strategy
-----------------
-Files are never fully downloaded. A small head range is fetched through
-``dc_stream`` (a datacenter-aware ranged reader) and grown step by step until
-``mediainfo`` / ``ffprobe`` can report a resolution. If the container keeps its
-index at the end of the file (fragmented MP4, some MKV muxers) a tail range is
-appended as well. Only when every step fails does the bot fall back to
-Telegram's own metadata.
-"""
+# Probing strategy
+# ----------------
+# Files are never fully downloaded. A small head range is fetched through
+# ``dc_stream`` (a datacenter-aware ranged reader) and grown step by step until
+# ``mediainfo`` / ``ffprobe`` can report a resolution. If the container keeps its
+# index at the end of the file (fragmented MP4, some MKV muxers) a tail range is
+# appended as well. Only when every step fails does the bot fall back to
+# Telegram's own metadata.
+# """
 
 import asyncio
 import json
