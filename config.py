@@ -1,5 +1,6 @@
-import os
 import logging
+import os
+from typing import Any, Optional
 
 
 def _get_int(name: str, default: int = 0) -> int:
@@ -9,7 +10,7 @@ def _get_int(name: str, default: int = 0) -> int:
         return default
 
 
-def _get_float(name: str, default: float) -> float:
+def _get_float(name: str, default: float = 0.0) -> float:
     try:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
@@ -35,7 +36,7 @@ def _get_chat_ids(name: str) -> list[int]:
     return ids
 
 
-# --- Telegram API credentials (required) ---
+# --- Telegram API credentials (required bootstrap env vars) ---
 API_ID = _get_int("API_ID")
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -46,6 +47,9 @@ ALLOWED_CHATS = _get_chat_ids("ALLOWED_CHATS")
 
 # --- Database ---
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://mongo:27017")
+DB_NAME = os.environ.get("DB_NAME", "MediaInfo-Bot")
+# Store WZGram MTProto session directly in MongoDB via MongoStorage
+USE_MONGO_SESSION = _get_bool("USE_MONGO_SESSION", True)
 
 # --- Logging ---
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -57,55 +61,111 @@ LOG_FORMAT = os.environ.get(
 )
 
 # --- Garbage collection thresholds (gen0, gen1, gen2) ---
-GC_THRESHOLD = (
-    _get_int("GC_GEN0", 700),
-    _get_int("GC_GEN1", 10),
-    _get_int("GC_GEN2", 10),
-)
+GC_GEN0 = _get_int("GC_GEN0", 700)
+GC_GEN1 = _get_int("GC_GEN1", 10)
+GC_GEN2 = _get_int("GC_GEN2", 10)
+GC_THRESHOLD = (GC_GEN0, GC_GEN1, GC_GEN2)
 
-# --- Caption template ---
+# --- Caption templates & presets ---
 # Available placeholders: {title} {video_line} {duration} {audio} {subtitle}
 # plus: {size} {bitrate} {fps} {resolution} {codec} {container} {filename}
-CAPTION_TEMPLATE = os.environ.get(
- #   "CAPTION_TEMPLATE",
-  #  "<b>\U0001F3AC {title}</b>\n\n"
-  #  "\U0001F39E <b>:</b> {video_line} | "
-  #  "\u23f3 <b>:</b> {duration}\n"
-  #  "\U0001F50A <b>:</b> {audio}\n"
-#    "\U0001F4AC <b>Subtitles:</b> {subtitle}",
-    "CAPTION_TEMPLATE",
+DEFAULT_CAPTION_TEMPLATE = (
     "<b>{title}</b>\n\n"
-    "🎬 <b>{video_line}</b> | ⏳ <b>{duration}</b>\n"
-    "🔊 <b>{audio}</b>\n"
-#    "💬 <b>{subtitle}</b>\n\n"
+    "\U0001F39E <b>{video_line}</b> | \u23f3 <b>{duration}</b>\n"
+    "\U0001F50A <b>{audio}</b>\n"
 )
 
-# --- Probing behaviour ---
-# Timeout (seconds) for each mediainfo / ffprobe subprocess call.
-PROBE_TIMEOUT = _get_float("PROBE_TIMEOUT", 15.0)
-# Timeout (seconds) for a single streaming step before it is abandoned.
-STREAM_TIMEOUT = _get_float("STREAM_TIMEOUT", 90.0)
-# How many times a streaming step is retried when the remote DC misbehaves.
-STREAM_RETRIES = _get_int("STREAM_RETRIES", 3)
-# Number of parallel media streams allowed (raise for faster multi-DC work).
+TEMPLATE_PRESETS: dict[str, tuple[str, str]] = {
+    "default": (
+        "Default Clean",
+        DEFAULT_CAPTION_TEMPLATE,
+    ),
+    "subs": (
+        "With Subtitles",
+        "<b>\U0001F3AC {title}</b>\n\n"
+        "\U0001F39E <b>{video_line}</b> | \u23f3 <b>{duration}</b>\n"
+        "\U0001F50A <b>{audio}</b>\n"
+        "\U0001F4AC <b>Subtitles:</b> {subtitle}\n",
+    ),
+    "detailed": (
+        "Detailed Technical",
+        "<b>\U0001F3AC {title}</b>\n\n"
+        "\U0001F39E <b>Video:</b> {video_line} ({fps})\n"
+        "\u23f3 <b>Duration:</b> {duration} | \U0001F4BE <b>Size:</b> {size}\n"
+        "\U0001F4CA <b>Bitrate:</b> {bitrate} | \U0001F4E6 <b>Format:</b> {container}\n"
+        "\U0001F50A <b>Audio:</b> {audio}\n"
+        "\U0001F4AC <b>Subtitles:</b> {subtitle}\n",
+    ),
+    "minimal": (
+        "Minimal Compact",
+        "<b>{title}</b>\n"
+        "\U0001F39E {video_line} \u2022 \u23f3 {duration} \u2022 \U0001F50A {audio}",
+    ),
+}
+
+CAPTION_TEMPLATE = os.environ.get("CAPTION_TEMPLATE") or DEFAULT_CAPTION_TEMPLATE
+
+# --- Probing & queue behaviour ---
+PROBE_TIMEOUT = max(3.0, _get_float("PROBE_TIMEOUT", 15.0))
+STREAM_TIMEOUT = max(10.0, _get_float("STREAM_TIMEOUT", 90.0))
+STREAM_RETRIES = max(1, _get_int("STREAM_RETRIES", 3))
 STREAM_CONCURRENCY = max(1, _get_int("STREAM_CONCURRENCY", 2))
-# Number of channels processed in parallel.
 CHANNEL_CONCURRENCY = max(1, _get_int("CHANNEL_CONCURRENCY", 2))
-# Also grab a chunk from the middle/end of the file when headers lack metadata
-# (needed by fragmented MP4 / MKV files whose cues live at the tail).
 ENABLE_TAIL_PROBE = _get_bool("ENABLE_TAIL_PROBE", True)
-# Directory used for temporary probe chunks.
+TAIL_SIZE_MB = max(1, _get_int("TAIL_SIZE_MB", 1))
 TMP_DIR = os.environ.get("TMP_DIR", "downloads")
-# Directory holding the pyrogram session file. Keeping it on a persistent
-# volume avoids re-creating the per-datacenter auth keys on every restart.
 SESSION_DIR = os.environ.get("SESSION_DIR", ".")
-
-# Default delay between caption edits in the same channel.
-EDIT_DELAY = _get_float("EDIT_DELAY", 3.5)
-
-# --- Optional features ---
-# Add "MediaInfo" inline button + full text report to /info replies.
+EDIT_DELAY = max(1.0, _get_float("EDIT_DELAY", 3.5))
 FULL_REPORT = _get_bool("FULL_REPORT", True)
+
+# --- Error alerting & retry thresholds ---
+ERROR_THRESHOLD = max(1, _get_int("ERROR_THRESHOLD", 3))
+ALERT_COOLDOWN = max(60, _get_int("ALERT_COOLDOWN", 600))
+MAX_RETRY_ATTEMPTS = max(1, _get_int("MAX_RETRY_ATTEMPTS", 5))
+
+
+def env_defaults_dict() -> dict[str, Any]:
+    """Return the complete dictionary of all live-configurable settings from env/defaults.
+
+    Used to seed MongoDB on first run and when resetting configs from the panel.
+    """
+    return {
+        "allowed_chats": sorted(set(ALLOWED_CHATS)),
+        "caption_template": CAPTION_TEMPLATE,
+        "edit_delay": EDIT_DELAY,
+        "probe_timeout": PROBE_TIMEOUT,
+        "stream_timeout": STREAM_TIMEOUT,
+        "stream_retries": STREAM_RETRIES,
+        "stream_concurrency": STREAM_CONCURRENCY,
+        "channel_concurrency": CHANNEL_CONCURRENCY,
+        "enable_tail_probe": ENABLE_TAIL_PROBE,
+        "tail_size_mb": TAIL_SIZE_MB,
+        "full_report": FULL_REPORT,
+        "paused": False,
+        "error_threshold": ERROR_THRESHOLD,
+        "alert_cooldown": ALERT_COOLDOWN,
+        "max_retry_attempts": MAX_RETRY_ATTEMPTS,
+        "log_level": LOG_LEVEL,
+        "gc_gen0": GC_GEN0,
+        "gc_gen1": GC_GEN1,
+        "gc_gen2": GC_GEN2,
+        "use_mongo_session": USE_MONGO_SESSION,
+    }
+
+
+def validate_template(template: str) -> Optional[str]:
+    """Return None if valid, or a human-readable error message."""
+    if not template or not template.strip():
+        return "Template cannot be empty"
+    try:
+        template.format(
+            title="", video_line="", duration="", audio="", subtitle="",
+            size="", bitrate="", fps="", resolution="", codec="",
+            container="", filename="",
+        )
+        return None
+    except (KeyError, IndexError, ValueError) as exc:
+        return f"Invalid placeholder or format syntax: {exc}"
 
 
 def validate() -> list[str]:
@@ -121,13 +181,7 @@ def validate() -> list[str]:
         problems.append("ADMIN_ID is missing or not a number")
     if not MONGO_URI:
         problems.append("MONGO_URI is missing")
-    try:
-        CAPTION_TEMPLATE.format(
-            title="", video_line="", duration="", audio="", subtitle="",
-            size="", bitrate="", fps="", resolution="", codec="",
-            container="", filename="",
-        )
-    except (KeyError, IndexError, ValueError) as exc:
-        problems.append(f"CAPTION_TEMPLATE is invalid: {exc}")
+    tpl_err = validate_template(CAPTION_TEMPLATE)
+    if tpl_err:
+        problems.append(f"CAPTION_TEMPLATE is invalid: {tpl_err}")
     return problems
-

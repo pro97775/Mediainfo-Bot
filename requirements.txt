@@ -1,10 +1,7 @@
-pyrofork==2.3.60
-# pyrofork's own TgCrypto build (the plain `tgcrypto` wheel targets pyrogram)
-TgCrypto-pyrofork==1.2.8
+wzgram[fast,mongo]==3.1.5
 motor==3.5.1
 psutil==6.0.0
 pymongo==4.8.0
 aiohttp==3.10.5
 aiofiles==24.1.0
 APScheduler==3.10.4
-
