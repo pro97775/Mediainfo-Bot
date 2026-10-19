@@ -2268,6 +2268,10 @@ async def private_handler(_, message):
             _admin_input_state.pop(user_id, None)
             await _authorize_chat_and_reply(message, fwd_chat.id)
             return
+        if st.get("mode") == "scan_custom":
+            _admin_input_state.pop(user_id, None)
+            await _handle_scan_custom_input(message, st)
+            return
 
     if user_id in active_users:
         await message.reply_text("\u26a0\ufe0f Please wait until your current file is processed.")
@@ -2884,7 +2888,10 @@ async def _build_chat_detail_view(cid: int, page: int = 0) -> tuple[str, InlineK
     rows.append([
         InlineKeyboardButton("\U0001F50E Scan 50", callback_data=f"adm:scan_run:{cid}:50"),
         InlineKeyboardButton("\U0001F50E Scan 200", callback_data=f"adm:scan_run:{cid}:200"),
-        InlineKeyboardButton("\U0001F50E More\u2026", callback_data=f"adm:scan_pick:{cid}"),
+        InlineKeyboardButton("\U0001F3AF By Post/ID", callback_data=f"adm:scan_custom:{cid}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("\U0001F50E More Scan Presets\u2026", callback_data=f"adm:scan_pick:{cid}"),
     ])
     action_row = []
     if q_len > 0:
@@ -3164,6 +3171,9 @@ async def _build_scan_pick_view(cid: int) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("1000 msgs", callback_data=f"adm:scan_run:{cid}:1000"),
         ],
         [
+            InlineKeyboardButton("\U0001F3AF Scan by Post Link / Forward / ID Range", callback_data=f"adm:scan_custom:{cid}"),
+        ],
+        [
             InlineKeyboardButton("\u2b05\ufe0f Inspector", callback_data=f"adm:chat_view:{cid}:0"),
             InlineKeyboardButton("\U0001F4E1 Channels", callback_data="adm:scan_menu"),
             InlineKeyboardButton("\U0001F39B Dashboard", callback_data="adm:home"),
@@ -3401,31 +3411,248 @@ async def user_callback_router(_, query):
     await query.answer()
 
 
-# --- HELPER FOR SCANNING A CHANNEL ---
-async def _execute_channel_scan(chat_id: int, limit: int, min_id: int = 0) -> tuple[int, int]:
-    """Scan up to `limit` messages in `chat_id` and queue uncaptioned ones in chronological order."""
+# --- BOT-COMPATIBLE CHANNEL BACKFILL SCANNER ---
+_TG_LINK_RE = re.compile(
+    r"(?:https?://)?t\.me/(?:c/(\d+)/(\d+)|([A-Za-z0-9_]{4,})/(\d+))",
+    re.IGNORECASE,
+)
+
+
+def _get_forwarded_msg_id(message) -> int:
+    """Extract the original channel message ID from a forwarded message."""
+    mid = getattr(message, "forward_from_message_id", None)
+    if mid:
+        return int(mid)
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        mid2 = getattr(origin, "message_id", None)
+        if mid2:
+            return int(mid2)
+    return 0
+
+
+async def _parse_post_link(text: str) -> tuple[Optional[int], int]:
+    """Parse a t.me post link into (chat_id, message_id), or (None, 0) if not a link."""
+    m = _TG_LINK_RE.search(text or "")
+    if not m:
+        return None, 0
+    if m.group(1) and m.group(2):
+        return int(f"-100{m.group(1)}"), int(m.group(2))
+    username, msg_id_str = m.group(3), m.group(4)
+    try:
+        chat = await app.get_chat(username)
+        return chat.id, int(msg_id_str)
+    except Exception:
+        return None, int(msg_id_str)
+
+
+def _is_valid_channel_msg(msg) -> bool:
+    """True when `msg` is a non-empty message returned by `app.get_messages`."""
+    if msg is None or getattr(msg, "empty", False):
+        return False
+    return bool(getattr(msg, "id", 0)) and (
+        getattr(msg, "date", None) is not None
+        or _media_of(msg) is not None
+        or getattr(msg, "text", None) is not None
+        or getattr(msg, "caption", None) is not None
+        or getattr(msg, "service", None) is not None
+    )
+
+
+async def _fetch_msg_batch(chat_id: int, ids: list[int]) -> list:
+    """Fetch up to 200 messages by ID using Bot-compatible `app.get_messages`."""
+    if not ids:
+        return []
+    for attempt in range(3):
+        try:
+            res = await app.get_messages(chat_id, ids)
+            if res is None:
+                return []
+            return list(res) if isinstance(res, (list, tuple)) else [res]
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+        except Exception as e:
+            if attempt == 2:
+                raise e
+            await asyncio.sleep(1 + attempt)
+    return []
+
+
+async def _resolve_channel_head_id(chat_id: int) -> int:
+    """Determine the latest message ID in `chat_id` for a Bot account.
+
+    Strategy:
+      1. Try sending & immediately deleting a silent probe message (1 RPC call, exact head ID).
+      2. If the bot lacks 'Post messages' rights, probe upward from `last_processed_id`
+         using batched `app.get_messages` (exponential + binary search) with zero posting.
+    """
+    try:
+        probe = await app.send_message(chat_id, ".", disable_notification=True)
+        head_id = max(0, int(probe.id) - 1)
+        await _delete_quietly(probe)
+        if head_id > 0:
+            return head_id
+    except Exception as e:
+        logger.debug(f"Silent probe post in {chat_id} unavailable ({e}); probing via get_messages")
+
+    base = max(1, await get_last_id(chat_id))
+    for qm in channel_queues.get(chat_id, []):
+        if getattr(qm, "id", 0) > base:
+            base = int(qm.id)
+
+    # Exponential multi-point probe in a single 200-ID batch
+    offsets = [0, 25, 75, 150, 300, 600, 1200, 2500, 5000, 10000, 25000, 50000]
+    probe_ids: list[int] = []
+    for off in offsets:
+        center = base + off
+        for d in range(-6, 7):
+            cand = center + d
+            if cand >= 1 and cand not in probe_ids and len(probe_ids) < 200:
+                probe_ids.append(cand)
+
+    batch = await _fetch_msg_batch(chat_id, probe_ids)
+    valid_ids = [int(m.id) for m in batch if _is_valid_channel_msg(m)]
+    if not valid_ids and base > 1:
+        # Also check 1..150 in case base was stale
+        low_batch = await _fetch_msg_batch(chat_id, list(range(1, 151)))
+        valid_ids = [int(m.id) for m in low_batch if _is_valid_channel_msg(m)]
+
+    if not valid_ids:
+        return base if base > 1 else 0
+
+    low_id = max(valid_ids)
+    higher_probes = [p for p in probe_ids if p > low_id]
+    high_id = min(higher_probes) if higher_probes else low_id + 500
+
+    # Refine between low_id and high_id in up to 3 steps of 200 IDs
+    for _ in range(3):
+        span = high_id - low_id
+        if span <= 1:
+            break
+        if span <= 200:
+            check_ids = list(range(low_id + 1, high_id + 1))
+            sub = await _fetch_msg_batch(chat_id, check_ids)
+            hits = [int(m.id) for m in sub if _is_valid_channel_msg(m)]
+            if hits:
+                low_id = max(hits)
+            break
+        step = max(1, span // 20)
+        sample: list[int] = []
+        for k in range(1, 20):
+            pt = low_id + k * step
+            for d in range(-4, 5):
+                c = pt + d
+                if low_id < c <= high_id and c not in sample and len(sample) < 200:
+                    sample.append(c)
+        sub = await _fetch_msg_batch(chat_id, sample)
+        hits = [int(m.id) for m in sub if _is_valid_channel_msg(m)]
+        if hits:
+            low_id = max(hits)
+            above = [s for s in sample if s > low_id]
+            if above:
+                high_id = min(above)
+        else:
+            high_id = min(sample) if sample else low_id
+
+    return low_id
+
+
+def _is_scannable_media_msg(msg) -> bool:
+    """True when `msg` has captionable media (excludes round video_notes without other media)."""
+    if not _is_valid_channel_msg(msg):
+        return False
+    if getattr(msg, "video_note", None) is not None and not (
+        getattr(msg, "video", None)
+        or getattr(msg, "document", None)
+        or getattr(msg, "animation", None)
+        or getattr(msg, "audio", None)
+        or getattr(msg, "voice", None)
+    ):
+        return False
+    return _media_of(msg) is not None
+
+
+async def _execute_channel_scan(
+    chat_id: int,
+    limit: int,
+    min_id: int = 0,
+    max_id: int = 0,
+    progress_cb=None,
+) -> tuple[int, int]:
+    """Scan up to `limit` messages in `chat_id` and queue uncaptioned ones in chronological order.
+
+    Uses Bot-compatible batched `app.get_messages(chat_id, ids)` so it never fails with
+    Telegram's `400 BOT_METHOD_INVALID` restriction on `messages.GetHistory`.
+    """
     limit = max(1, min(int(limit), 2000))
     to_queue = []
     skipped = 0
-    async for msg in app.get_chat_history(chat_id, limit=limit):
-        if min_id and getattr(msg, "id", 0) <= min_id:
-            break
-        if getattr(msg, "video_note", None) is not None and not (
-            getattr(msg, "video", None)
-            or getattr(msg, "document", None)
-            or getattr(msg, "animation", None)
-            or getattr(msg, "audio", None)
-            or getattr(msg, "voice", None)
-        ):
-            continue
-        if _media_of(msg) is None:
-            continue
-        if caption_has_media_info(msg.caption or ''):
-            skipped += 1
-            continue
-        to_queue.append(msg)
 
-    to_queue.reverse()
+    # If running under a user session (no bot_token) and get_chat_history works, try it first
+    used_history = False
+    if not getattr(app, "bot_token", BOT_TOKEN) and max_id <= 0:
+        try:
+            async for msg in app.get_chat_history(chat_id, limit=limit):
+                used_history = True
+                if min_id and getattr(msg, "id", 0) <= min_id:
+                    break
+                if not _is_scannable_media_msg(msg):
+                    continue
+                if caption_has_media_info(msg.caption or ""):
+                    skipped += 1
+                    continue
+                to_queue.append(msg)
+        except Exception as e:
+            logger.debug(f"get_chat_history unavailable ({e}); using Bot get_messages batch scan")
+            to_queue.clear()
+            skipped = 0
+            used_history = False
+
+    if not used_history:
+        if max_id <= 0:
+            if progress_cb:
+                await progress_cb(f"\U0001F50E Locating latest post in <code>{chat_id}</code>\u2026")
+            max_id = await _resolve_channel_head_id(chat_id)
+
+        if min_id > 0:
+            start_id = min_id + 1
+            if max_id >= start_id:
+                end_id = min(max_id, start_id + limit - 1)
+            else:
+                end_id = start_id + limit - 1
+        else:
+            if max_id <= 0:
+                raise RuntimeError(
+                    "Could not auto-detect the latest message ID in this channel. "
+                    "Use '🎯 By Post/ID' and forward a post or send a post link from the channel."
+                )
+            end_id = max_id
+            start_id = max(1, end_id - limit + 1)
+
+        if end_id < start_id:
+            return 0, 0
+
+        all_ids = list(range(start_id, end_id + 1))
+        total_ids = len(all_ids)
+        for offset in range(0, total_ids, 200):
+            chunk_ids = all_ids[offset : offset + 200]
+            if progress_cb and total_ids > 200:
+                await progress_cb(
+                    f"\U0001F50E Scanning messages <code>#{chunk_ids[0]}\u2013#{chunk_ids[-1]}</code> "
+                    f"({min(offset + 200, total_ids)}/{total_ids})\u2026"
+                )
+            batch = await _fetch_msg_batch(chat_id, chunk_ids)
+            for msg in batch:
+                if not _is_scannable_media_msg(msg):
+                    continue
+                if min_id and int(msg.id) <= min_id:
+                    continue
+                if caption_has_media_info(msg.caption or ""):
+                    skipped += 1
+                    continue
+                to_queue.append(msg)
+
+    to_queue.sort(key=lambda m: getattr(m, "id", 0))
     queued = 0
     for msg in to_queue:
         if _enqueue_channel_message(chat_id, msg):
@@ -3969,6 +4196,28 @@ async def admin_callback_router(_, query):
         await _safe_edit(query.message, text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return await query.answer()
 
+    if cmd == "scan_custom":
+        cid = int(parts[2])
+        if cid not in authorized_chats:
+            return await query.answer("Channel is not authorized.", show_alert=True)
+        _admin_input_state[ADMIN_ID] = {"mode": "scan_custom", "cid": cid, "ts": time.time()}
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\u274c Cancel", callback_data=f"adm:scan_pick:{cid}")]
+        ])
+        await _safe_edit(
+            query.message,
+            f"<b>\U0001F3AF Targeted Channel Backfill \u2022 <code>{cid}</code></b>\n\n"
+            "<blockquote>"
+            "\u251c <b>Option 1:</b> Forward the latest media post from that channel here\n"
+            "\u251c <b>Option 2:</b> Send a post link (e.g. <code>https://t.me/c/123456/450</code>)\n"
+            "\u251c <b>Option 3:</b> Send an ID range like <code>100-450</code>\n"
+            "\u2514 <b>Option 4:</b> Send <code>&lt;latest_msg_id&gt; [limit]</code> (e.g. <code>450 200</code>)"
+            "</blockquote>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+        return await query.answer()
+
     if cmd in ("scan_run", "scan_since"):
         cid = int(parts[2])
         limit = int(parts[3]) if len(parts) > 3 else 100
@@ -3982,7 +4231,14 @@ async def admin_callback_router(_, query):
             parse_mode=ParseMode.HTML,
         )
         try:
-            queued, skipped = await _execute_channel_scan(cid, limit, min_id=min_id)
+            queued, skipped = await _execute_channel_scan(
+                cid,
+                limit,
+                min_id=min_id,
+                progress_cb=lambda t: _safe_edit(
+                    query.message, f"<b>{t}</b>", parse_mode=ParseMode.HTML, throttle=True
+                ),
+            )
         except Exception as e:
             text, kb = await _build_scan_pick_view(cid)
             await _safe_edit(
@@ -4271,6 +4527,9 @@ async def admin_interactive_input_handler(_, message):
             reply_markup=kb,
         )
 
+    elif mode == "scan_custom":
+        await _handle_scan_custom_input(message, st)
+
     elif mode == "broadcast":
         bcast_text = (message.text or "").strip()
         if not bcast_text:
@@ -4479,29 +4738,173 @@ async def logs_cmd(_, message):
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+async def _handle_scan_custom_input(message, st: dict):
+    """Process forwarded post, t.me link, or ID range for targeted channel backfill."""
+    cid = int(st.get("cid") or 0)
+    limit = 200
+    min_id = 0
+    max_id = 0
+
+    fwd_chat = _get_forwarded_chat(message)
+    fwd_mid = _get_forwarded_msg_id(message)
+    if fwd_chat and fwd_mid:
+        cid = fwd_chat.id
+        max_id = fwd_mid
+    else:
+        raw = (message.text or message.caption or "").strip()
+        link_cid, link_mid = await _parse_post_link(raw)
+        if link_mid > 0:
+            if link_cid is not None:
+                cid = link_cid
+            max_id = link_mid
+            parts = raw.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                limit = max(1, min(int(parts[1]), 2000))
+        elif "-" in raw and all(p.strip().isdigit() for p in raw.split("-", 1)):
+            a_str, b_str = [p.strip() for p in raw.split("-", 1)]
+            start_id, end_id = sorted((int(a_str), int(b_str)))
+            min_id = max(0, start_id - 1)
+            max_id = end_id
+            limit = max(1, min(end_id - start_id + 1, 2000))
+        else:
+            tokens = raw.split()
+            if tokens and tokens[0].isdigit():
+                max_id = int(tokens[0])
+                if len(tokens) > 1 and tokens[1].isdigit():
+                    limit = max(1, min(int(tokens[1]), 2000))
+
+    if not cid or max_id <= 0:
+        text, kb = await _build_scan_pick_view(cid) if cid in authorized_chats else await _build_scan_menu_view()
+        return await message.reply_text(
+            "\u274c Could not determine a message ID. Forward a channel post, send a "
+            "<code>https://t.me/...</code> post link, or send an ID range like <code>100-450</code>.\n\n" + text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+        )
+
+    if cid not in authorized_chats:
+        authorized_chats.add(cid)
+        await save_runtime_settings(allowed_chats=sorted(authorized_chats))
+
+    status = await message.reply_text(
+        f"\U0001F50E <b>Scanning up to {limit} message(s) up to <code>#{max_id}</code> in <code>{cid}</code>\u2026</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        queued, skipped = await _execute_channel_scan(
+            cid,
+            limit,
+            min_id=min_id,
+            max_id=max_id,
+            progress_cb=lambda t: _safe_edit(status, f"<b>{t}</b>", parse_mode=ParseMode.HTML, throttle=True),
+        )
+    except Exception as e:
+        return await _safe_edit(
+            status,
+            f"\u274c <b>Scan failed:</b> <code>{html.escape(str(e))[:250]}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001F4E5 View Queue", callback_data="adm:queue"),
+            InlineKeyboardButton("\U0001F4E1 Channel Inspector", callback_data=f"adm:chat_view:{cid}:0"),
+        ],
+        [InlineKeyboardButton("\U0001F39B Dashboard", callback_data="adm:home")],
+    ])
+    await _safe_edit(
+        status,
+        "<b>\u2705 Targeted Scan Complete</b>\n\n"
+        "<blockquote>"
+        f"\u251c <b>Channel:</b> <code>{cid}</code>\n"
+        f"\u251c <b>Scanned Up To:</b> <code>#{max_id}</code>\n"
+        f"\u251c <b>Queued for Captioning:</b> <code>{queued}</code>\n"
+        f"\u2514 <b>Skipped (Already Captioned):</b> <code>{skipped}</code>"
+        "</blockquote>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+@app.on_message(filters.channel & filters.command("scan"))
+async def channel_scan_cmd(_, message):
+    """Allow running `/scan [limit]` directly inside an authorized channel."""
+    chat_id = message.chat.id
+    if chat_id not in authorized_chats:
+        return
+    limit = 100
+    if len(message.command) > 1 and message.command[1].isdigit():
+        limit = max(1, min(int(message.command[1]), 2000))
+    max_id = max(1, int(message.id) - 1)
+    await _delete_quietly(message)
+    try:
+        queued, skipped = await _execute_channel_scan(chat_id, limit, max_id=max_id)
+        if ADMIN_ID:
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("\U0001F4E5 View Queue", callback_data="adm:queue"),
+                    InlineKeyboardButton("\U0001F4E1 Inspector", callback_data=f"adm:chat_view:{chat_id}:0"),
+                ]
+            ])
+            await app.send_message(
+                ADMIN_ID,
+                "<b>\u2705 In-Channel Backfill Triggered</b>\n\n"
+                "<blockquote>"
+                f"\u251c <b>Channel:</b> <code>{chat_id}</code>\n"
+                f"\u251c <b>Scanned Up To:</b> <code>#{max_id}</code> (limit <code>{limit}</code>)\n"
+                f"\u251c <b>Queued:</b> <code>{queued}</code>\n"
+                f"\u2514 <b>Skipped:</b> <code>{skipped}</code>"
+                "</blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+    except Exception as e:
+        logger.error(f"In-channel /scan failed in {chat_id}: {e}")
+
+
 @app.on_message(filters.command("scan") & filters.user(ADMIN_ID))
 async def scan_cmd(_, message):
     """Backfill captions for older messages in a channel."""
     args = message.command[1:]
-    if not args and message.chat.id == ADMIN_ID:
+    reply = getattr(message, "reply_to_message", None)
+    fwd_chat = _get_forwarded_chat(reply) if reply else None
+    fwd_mid = _get_forwarded_msg_id(reply) if reply else 0
+
+    if not args and not fwd_chat and message.chat.id == ADMIN_ID:
         text, kb = await _build_scan_menu_view()
         return await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    chat_id: Optional[int] = None
+    chat_id: Optional[int] = fwd_chat.id if fwd_chat else None
     limit = 100
+    max_id = fwd_mid if fwd_mid > 0 else 0
 
     if args:
-        try:
-            chat_id = int(args[0])
-        except ValueError:
-            chat_id = await _resolve_chat_arg(message)
+        link_cid, link_mid = await _parse_post_link(args[0])
+        if link_mid > 0:
+            if link_cid is not None:
+                chat_id = link_cid
+            max_id = link_mid
+            if len(args) > 1 and args[1].isdigit():
+                limit = max(1, min(int(args[1]), 2000))
+        elif fwd_chat and args[0].isdigit():
+            limit = max(1, min(int(args[0]), 2000))
+        else:
+            try:
+                chat_id = int(args[0])
+            except ValueError:
+                chat_id = await _resolve_chat_arg(message)
+            if len(args) > 1:
+                try:
+                    limit = max(1, min(int(args[1]), 2000))
+                except ValueError:
+                    pass
+            if len(args) > 2 and args[2].isdigit():
+                max_id = int(args[2])
+
     if chat_id is None:
         chat_id = message.chat.id
-    if len(args) > 1:
-        try:
-            limit = max(1, min(int(args[1]), 2000))
-        except ValueError:
-            pass
+        if message.chat.id != ADMIN_ID and max_id <= 0:
+            max_id = max(1, int(message.id) - 1)
 
     if chat_id not in authorized_chats:
         return await message.reply_text(
@@ -4509,22 +4912,44 @@ async def scan_cmd(_, message):
             parse_mode=ParseMode.HTML,
         )
 
-    status = await message.reply_text(f"\U0001F50E Scanning last {limit} messages\u2026")
+    status = await message.reply_text(
+        f"\U0001F50E <b>Scanning last {limit} messages in <code>{chat_id}</code>\u2026</b>",
+        parse_mode=ParseMode.HTML,
+    )
     try:
-        queued, skipped = await _execute_channel_scan(chat_id, limit)
+        queued, skipped = await _execute_channel_scan(
+            chat_id,
+            limit,
+            max_id=max_id,
+            progress_cb=lambda t: _safe_edit(status, f"<b>{t}</b>", parse_mode=ParseMode.HTML, throttle=True),
+        )
     except Exception as e:
-        return await _safe_edit(status, f"\u274c Scan failed: {html.escape(str(e))[:200]}")
+        kb_err = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001F3AF Scan by Post / Link", callback_data=f"adm:scan_custom:{chat_id}")],
+            [InlineKeyboardButton("\U0001F39B Dashboard", callback_data="adm:home")],
+        ])
+        return await _safe_edit(
+            status,
+            f"\u274c <b>Scan failed:</b> <code>{html.escape(str(e))[:250]}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_err,
+        )
 
     kb = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("\U0001F4E5 View Queue", callback_data="adm:queue"),
-            InlineKeyboardButton("\U0001F39B Dashboard", callback_data="adm:home"),
-        ]
+            InlineKeyboardButton("\U0001F4E1 Channel Inspector", callback_data=f"adm:chat_view:{chat_id}:0"),
+        ],
+        [InlineKeyboardButton("\U0001F39B Dashboard", callback_data="adm:home")],
     ])
     await _safe_edit(
         status,
-        f"\u2705 Queued <b>{queued}</b> message(s), skipped <b>{skipped}</b> "
-        f"already captioned.",
+        "<b>\u2705 Scan Complete</b>\n\n"
+        "<blockquote>"
+        f"\u251c <b>Channel:</b> <code>{chat_id}</code>\n"
+        f"\u251c <b>Queued for Captioning:</b> <code>{queued}</code>\n"
+        f"\u2514 <b>Skipped (Already Captioned):</b> <code>{skipped}</code>"
+        "</blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
     )
